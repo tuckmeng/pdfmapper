@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PDF Variable Extractor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+    body { font-family: sans-serif; font-size: 13px; margin: 20px; color: #333; }
+    .controls { background: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px; border: 1px solid #ddd; }
+    
+    /* Table Styling */
+    .table-section { margin-bottom: 15px; overflow-x: auto; }
+    table { border-collapse: collapse; width: auto; background: #fff; min-width: 300px; }
+    th, td { border: 1px solid #ccc; padding: 6px 12px; white-space: nowrap; text-align: left; }
+    th { background: #007bff; color: white; }
+    tr:hover { background: #f1f1f1; cursor: pointer; }
+    .active-row { background: #e7f3ff !important; }
+
+    /* Button Styling */
+    .btn-group { margin-top: 10px; display: flex; gap: 10px; }
+    button { cursor: pointer; padding: 8px 16px; border: 1px solid #ccc; background: #fff; border-radius: 4px; }
+    button:hover { background: #e9ecef; }
+    .btn-primary { background: #007bff; color: white; border: none; }
+    .btn-success { background: #28a745; color: white; border: none; margin-top: 10px; }
+
+    /* Preview Section Styling */
+    .preview-section { margin-top: 30px; padding-top: 20px; border-top: 2px solid #eee; }
+    .preview-pane { background: #f0f0f0; padding: 15px; border-radius: 5px; display: inline-block; }
+    .nav-tools { margin-bottom: 10px; display: flex; gap: 10px; align-items: center; font-weight: bold; }
+    canvas { border: 1px solid #333; box-shadow: 2px 2px 8px rgba(0,0,0,0.2); background: white; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<div class="controls">
+    <strong>1. Mapping TSV:</strong> <input type="file" id="tsvFile" accept=".tsv"> 
+    <strong style="margin-left:20px;">2. PDF Files:</strong> <input type="file" id="pdfFiles" accept="application/pdf" multiple>
+    <div class="btn-group">
+        <button id="run" class="btn-primary">Extract All Data</button>
+    </div>
+</div>
+
+<h3>Click on each row to see where the values are extracted from</h3>
+<div class="table-section">
+    <table id="results">
+        <thead><tr id="header"><th>Filename</th></tr></thead>
+        <tbody id="rows"></tbody>
+    </table>
+</div>
+
+<button id="exportTSV" class="btn-success" style="display:none;">Save Result as TSV</button>
+
+<div class="preview-section" id="debugSection" style="display:none;">
+    <div class="preview-pane">
+        <h4 style="margin:0 0 10px 0;">Preview & Debug</h4>
+        <div class="nav-tools">
+            <button id="prevPage">Prev Page</button>
+            <span>Page: <span id="curPageDisplay">1</span> / <span id="totalPageDisplay">1</span></span>
+            <button id="nextPage">Next Page</button>
+        </div>
+        <canvas id="debugCanvas"></canvas>
+    </div>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+let mappings = [], pdfDocs = new Map(), extractionResults = [];
+let currentDocName = null, currentPageNum = 1, scale = 1.5;
+
+// Load TSV Mapping
+document.getElementById('tsvFile').onchange = e => {
+    const reader = new FileReader();
+    reader.onload = () => {
+        mappings = reader.result.trim().split('\n').map(l => {
+            const [name, x1, y1, x2, y2, page] = l.split('\t');
+            return { name, x1: parseFloat(x1), y1: parseFloat(y1), x2: parseFloat(x2), y2: parseFloat(y2), page: parseInt(page) };
+        });
+    };
+    reader.readAsText(e.target.files[0]);
+};
+
+// Run Extraction
+document.getElementById('run').onclick = async () => {
+    const files = document.getElementById('pdfFiles').files;
+    if (!files.length || !mappings.length) return alert("Please load both TSV and PDFs.");
+    
+    const varNames = [...new Set(mappings.map(m => m.name))];
+    document.getElementById('header').innerHTML = '<th>Filename</th>' + varNames.map(v => `<th>${v}</th>`).join('');
+    const body = document.getElementById('rows');
+    body.innerHTML = '';
+    extractionResults = [];
+
+    for (let file of files) {
+        const doc = await pdfjsLib.getDocument(await file.arrayBuffer()).promise;
+        pdfDocs.set(file.name, doc);
+        const data = { _filename: file.name };
+
+        for (let m of mappings) {
+            if (m.page > doc.numPages) continue;
+            const page = await doc.getPage(m.page);
+            const content = await page.getTextContent();
+            const viewport = page.getViewport({ scale });
+            const xMin = Math.min(m.x1, m.x2), xMax = Math.max(m.x1, m.x2), yMin = Math.min(m.y1, m.y2), yMax = Math.max(m.y1, m.y2);
+
+            // Using Canvas Transform logic
+            const txt = content.items.filter(item => {
+                const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+                return tx[4] >= xMin && tx[4] <= xMax && tx[5] >= yMin && tx[5] <= yMax;
+            }).map(i => i.str).join(' ');
+
+            data[m.name] = (data[m.name] ? data[m.name] + " " : "") + txt;
+        }
+        extractionResults.push(data);
+        const tr = document.createElement('tr');
+        tr.onclick = () => {
+            document.querySelectorAll('tr').forEach(r => r.classList.remove('active-row'));
+            tr.classList.add('active-row');
+            currentDocName = file.name;
+            currentPageNum = mappings[0]?.page || 1;
+            document.getElementById('debugSection').style.display = 'block';
+            drawDebug();
+        };
+        tr.innerHTML = `<td>${data._filename}</td>` + varNames.map(v => `<td>${data[v] || ''}</td>`).join('');
+        body.appendChild(tr);
+    }
+    document.getElementById('exportTSV').style.display = 'block';
+};
+
+// Save Results as TSV
+document.getElementById('exportTSV').onclick = () => {
+    const varNames = [...new Set(mappings.map(m => m.name))];
+    const header = ['Filename', ...varNames].join('\t');
+    const rows = extractionResults.map(res => [res._filename, ...varNames.map(v => res[v] || '')].join('\t'));
+    const content = [header, ...rows].join('\n');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content])); a.download = 'extracted_data.tsv'; a.click();
+};
+
+// Draw Debug Preview
+async function drawDebug() {
+    if (!currentDocName) return;
+    const doc = pdfDocs.get(currentDocName);
+    const page = await doc.getPage(currentPageNum);
+    const viewport = page.getViewport({ scale });
+    
+    const cvs = document.getElementById('debugCanvas');
+    const ctx = cvs.getContext('2d');
+    cvs.width = viewport.width; cvs.height = viewport.height;
+    
+    document.getElementById('curPageDisplay').innerText = currentPageNum;
+    document.getElementById('totalPageDisplay').innerText = doc.numPages;
+
+    await page.render({ canvasContext: ctx, viewport }).promise;
+
+    ctx.strokeStyle = 'red'; ctx.lineWidth = 2;
+    mappings.filter(m => m.page === currentPageNum).forEach(m => {
+        ctx.strokeRect(m.x1, m.y1, m.x2 - m.x1, m.y2 - m.y1);
+        ctx.fillStyle = 'red'; ctx.font = "bold 12px Arial";
+        ctx.fillText(m.name, m.x1, m.y1 - 5);
+    });
+}
+
+// Page Nav
+document.getElementById('prevPage').onclick = () => { if (currentPageNum > 1) { currentPageNum--; drawDebug(); } };
+document.getElementById('nextPage').onclick = () => {
+    const doc = pdfDocs.get(currentDocName);
+    if (doc && currentPageNum < doc.numPages) { currentPageNum++; drawDebug(); }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PDF Variable Mapper (Canvas Mode - Compact)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+    body { font-family: sans-serif; font-size: 13px; margin: 15px; }
+    canvas { border: 1px solid #000; cursor: crosshair; display: block; margin-bottom: 10px; }
+    #toolbar { background: #f0f0f0; padding: 10px; border-radius: 4px; margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
+    table { border-collapse: collapse; width: auto; min-width: 600px; margin-top: 10px; }
+    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; white-space: nowrap; }
+    th { background: #e9ecef; }
+    textarea { width: 200px; height: 24px; vertical-align: middle; font-size: 11px; }
+    input[type="number"] { width: 50px; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <strong>PDF:</strong> <input type="file" id="pdfFile" accept="application/pdf">
+  <button id="prev">&lt;</button> <span>Page</span> <input id="pageNum" type="number" value="1"> <button id="next">&gt;</button>
+  <button id="saveTSV" style="margin-left:auto; background:#28a745; color:white; border:none; padding:5px 10px; cursor:pointer;">Save Mapping TSV</button>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<table>
+    <thead><tr><th>Name</th><th>X1</th><th>Y1</th><th>X2</th><th>Y2</th><th>Page</th><th>Extracted Text (Preview)</th></tr></thead>
+    <tbody id="rectTableBody"></tbody>
+</table>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const bufferCanvas = document.createElement('canvas');
+const bufferCtx = bufferCanvas.getContext('2d');
+let pdf = null, pageNum = 1, scale = 1.5, rectangles = [], activeRect = null;
+
+document.getElementById('pdfFile').onchange = e => {
+  const reader = new FileReader();
+  reader.onload = () => { pdfjsLib.getDocument(reader.result).promise.then(d => { pdf = d; renderPdf(); }); };
+  reader.readAsArrayBuffer(e.target.files[0]);
+};
+
+function renderPdf() {
+  if (!pdf) return;
+  pdf.getPage(pageNum).then(page => {
+    const viewport = page.getViewport({ scale });
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    bufferCanvas.width = viewport.width; bufferCanvas.height = viewport.height;
+    page.render({ canvasContext: bufferCtx, viewport }).promise.then(() => { redraw(); extractText(page); });
+    document.getElementById('pageNum').value = pageNum;
+  });
+}
+
+function redraw() { ctx.drawImage(bufferCanvas, 0, 0); ctx.strokeStyle = 'red'; rectangles.filter(r => r.page === pageNum).forEach(r => { ctx.strokeRect(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1); }); }
+
+canvas.onmousedown = e => {
+    const rect = canvas.getBoundingClientRect();
+    activeRect = { page: pageNum, name: '', x1: e.clientX - rect.left, y1: e.clientY - rect.top, x2: e.clientX - rect.left, y2: e.clientY - rect.top };
+    rectangles.push(activeRect);
+};
+canvas.onmousemove = e => { if (!activeRect) return; const rect = canvas.getBoundingClientRect(); activeRect.x2 = e.clientX - rect.left; activeRect.y2 = e.clientY - rect.top; redraw(); };
+canvas.onmouseup = () => { if (!activeRect) return; const name = prompt("Variable Name:"); if (!name) rectangles.pop(); else activeRect.name = name; activeRect = null; updateTable(); renderPdf(); };
+
+async function extractText(page) {
+    const textContent = await page.getTextContent();
+    const viewport = page.getViewport({ scale });
+    rectangles.filter(r => r.page === page.pageNumber).forEach(r => {
+        const xMin = Math.min(r.x1, r.x2), xMax = Math.max(r.x1, r.x2), yMin = Math.min(r.y1, r.y2), yMax = Math.max(r.y1, r.y2);
+        r.extractedText = textContent.items.filter(item => {
+            const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+            return tx[4] >= xMin && tx[4] <= xMax && tx[5] >= yMin && tx[5] <= yMax;
+        }).map(i => i.str).join(' ');
+    });
+    updateTable();
+}
+
+function updateTable() {
+    document.getElementById('rectTableBody').innerHTML = rectangles.map(r => `<tr><td>${r.name}</td><td>${r.x1.toFixed(0)}</td><td>${r.y1.toFixed(0)}</td><td>${r.x2.toFixed(0)}</td><td>${r.y2.toFixed(0)}</td><td>${r.page}</td><td><textarea readonly>${r.extractedText || ''}</textarea></td></tr>`).join('');
+}
+
+document.getElementById('saveTSV').onclick = () => {
+    const content = rectangles.map(r => `${r.name}\t${r.x1}\t${r.y1}\t${r.x2}\t${r.y2}\t${r.page}`).join('\n');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([content])); a.download = 'mapping.tsv'; a.click();
+};
+document.getElementById('next').onclick = () => { if (pdf && pageNum < pdf.numPages) { pageNum++; renderPdf(); } };
+document.getElementById('prev').onclick = () => { if (pageNum > 1) { pageNum--; renderPdf(); } };
+</script>
+</body>
+</html>
