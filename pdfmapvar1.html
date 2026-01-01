@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PDF Variable Mapper (TSV Excludes Value)</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+<style>
+body { font-family: sans-serif; font-size: 13px; margin: 15px; }
+canvas { border: 1px solid #000; cursor: crosshair; display: block; margin-bottom: 10px; }
+#toolbar { background: #f0f0f0; padding: 10px; border-radius: 4px; margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
+table { border-collapse: collapse; min-width: 950px; }
+th, td { border: 1px solid #ccc; padding: 4px; }
+th { background: #e9ecef; }
+textarea { width: 260px; height: 26px; font-size: 11px; }
+input[type="text"] { width: 140px; font-size: 12px; }
+button { font-size: 11px; }
+button.del { background:#dc3545;color:#fff;border:none;padding:4px 8px; cursor:pointer; }
+button.ocr { background:#007bff;color:#fff;border:none;padding:4px 8px; cursor:pointer; }
+tr.active { background:#fff3cd; }
+</style>
+</head>
+
+<body>
+
+<div id="toolbar">
+  <strong>PDF:</strong>
+  <input type="file" id="pdfFile" accept="application/pdf">
+  <button id="prev">&lt;</button>
+  Page <input id="pageNum" type="number" value="1" style="width:50px">
+  <button id="next">&gt;</button>
+  <button id="saveTSV" style="margin-left:auto;background:#28a745;color:white;border:none;padding:6px 12px">
+    Save Mapping TSV
+  </button>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<table>
+<thead>
+<tr>
+  <th>Name</th>
+  <th>X1</th><th>Y1</th><th>X2</th><th>Y2</th>
+  <th>Page</th>
+  <th>Value (Editable)</th>
+  <th>Actions</th>
+</tr>
+</thead>
+<tbody id="rectTableBody"></tbody>
+</table>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const bufferCanvas = document.createElement('canvas');
+const bufferCtx = bufferCanvas.getContext('2d');
+
+let pdf = null;
+let pageNum = 1;
+let scale = 1.5;
+let rectangles = [];
+let activeRect = null;
+let selectedIndex = null;
+
+/* ---------------- PDF LOAD ---------------- */
+
+document.getElementById('pdfFile').onchange = e => {
+  const reader = new FileReader();
+  reader.onload = () => {
+    pdfjsLib.getDocument(reader.result).promise.then(d => {
+      pdf = d;
+      renderPdf();
+    });
+  };
+  reader.readAsArrayBuffer(e.target.files[0]);
+};
+
+async function renderPdf() {
+  if (!pdf) return;
+  const page = await pdf.getPage(pageNum);
+  const viewport = page.getViewport({ scale });
+
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  bufferCanvas.width = viewport.width;
+  bufferCanvas.height = viewport.height;
+
+  await page.render({ canvasContext: bufferCtx, viewport }).promise;
+  redraw();
+  extractText(page); // auto-populate values
+}
+
+/* ---------------- DRAWING ---------------- */
+
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bufferCanvas, 0, 0);
+
+  rectangles.forEach((r, i) => {
+    if (r.page !== pageNum) return;
+    ctx.strokeStyle = (i === selectedIndex) ? 'orange' : 'red';
+    ctx.strokeRect(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1);
+  });
+}
+
+/* ---------------- RECTANGLE CREATION ---------------- */
+
+canvas.onmousedown = e => {
+  const b = canvas.getBoundingClientRect();
+  const x = e.clientX - b.left;
+  const y = e.clientY - b.top;
+
+  activeRect = { page: pageNum, name:'', extractedText:'', x1:x, y1:y, x2:x, y2:y };
+  rectangles.push(activeRect);
+};
+
+canvas.onmousemove = e => {
+  if (!activeRect) return;
+  const b = canvas.getBoundingClientRect();
+  activeRect.x2 = e.clientX - b.left;
+  activeRect.y2 = e.clientY - b.top;
+  redraw();
+};
+
+canvas.onmouseup = () => {
+  if (!activeRect) return;
+
+  const name = prompt('Variable name:');
+  if (!name) {
+    rectangles.pop();
+    activeRect = null;
+    redraw();
+    return;
+  }
+
+  activeRect.name = name;
+  selectedIndex = rectangles.length - 1;
+  activeRect = null;
+
+  // extract text immediately for the current page
+  if (pdf) {
+    pdf.getPage(pageNum).then(page => extractText(page));
+  }
+
+  updateTable();
+  redraw();
+};
+
+/* ---------------- ORIGINAL TEXT EXTRACTION ---------------- */
+
+async function extractText(page) {
+  const textContent = await page.getTextContent();
+  const viewport = page.getViewport({ scale });
+
+  rectangles
+    .filter(r => r.page === page.pageNumber)
+    .forEach(r => {
+      const xMin = Math.min(r.x1, r.x2);
+      const xMax = Math.max(r.x1, r.x2);
+      const yMin = Math.min(r.y1, r.y2);
+      const yMax = Math.max(r.y1, r.y2);
+
+      r.extractedText = textContent.items.filter(item => {
+        const t = pdfjsLib.Util.transform(viewport.transform, item.transform);
+        return t[4] >= xMin && t[4] <= xMax &&
+               t[5] >= yMin && t[5] <= yMax;
+      }).map(i => i.str).join(' ');
+    });
+
+  updateTable();
+}
+
+/* ---------------- MANUAL OCR ---------------- */
+
+async function manualOCR(i) {
+  const r = rectangles[i];
+  r.extractedText = '? OCR...';
+  updateTable();
+
+  const w = Math.abs(r.x2 - r.x1);
+  const h = Math.abs(r.y2 - r.y1);
+  const temp = document.createElement('canvas');
+  temp.width = w;
+  temp.height = h;
+
+  temp.getContext('2d').drawImage(
+    bufferCanvas,
+    Math.min(r.x1,r.x2),
+    Math.min(r.y1,r.y2),
+    w,h,0,0,w,h
+  );
+
+  const res = await Tesseract.recognize(temp,'eng');
+  r.extractedText = res.data.text.trim();
+  updateTable();
+}
+
+/* ---------------- TABLE ---------------- */
+
+function updateTable() {
+  document.getElementById('rectTableBody').innerHTML =
+    rectangles.map((r,i)=>`
+      <tr>
+        <td><input value="${r.name}" onchange="rectangles[${i}].name=this.value"></td>
+        <td>${r.x1.toFixed(0)}</td>
+        <td>${r.y1.toFixed(0)}</td>
+        <td>${r.x2.toFixed(0)}</td>
+        <td>${r.y2.toFixed(0)}</td>
+        <td>${r.page}</td>
+        <td><textarea onchange="rectangles[${i}].extractedText=this.value">${r.extractedText||''}</textarea></td>
+        <td>
+          <button class="ocr" onclick="manualOCR(${i})">OCR</button>
+          <button class="del" onclick="rectangles.splice(${i},1);updateTable();redraw();">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+}
+
+/* ---------------- SAVE ---------------- */
+
+document.getElementById('saveTSV').onclick = () => {
+  // Only include: name, x1, y1, x2, y2, page (exclude Value)
+  const content = rectangles.map(r =>
+    `${r.name}\t${r.x1}\t${r.y1}\t${r.x2}\t${r.y2}\t${r.page}`
+  ).join('\n');
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([content], {type:'text/tab-separated-values'}));
+  a.download = 'mapping.tsv';
+  a.click();
+};
+
+/* ---------------- NAVIGATION ---------------- */
+
+document.getElementById('next').onclick = () => {
+  if (pdf && pageNum < pdf.numPages) { pageNum++; renderPdf(); }
+};
+document.getElementById('prev').onclick = () => {
+  if (pageNum > 1) { pageNum--; renderPdf(); }
+};
+</script>
+</body>
+</html>
